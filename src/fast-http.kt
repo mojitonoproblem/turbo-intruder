@@ -129,17 +129,18 @@ class RequestEngine:
 }
 
 
-class Target(val req: String, val endpoint: String, val baseInput: String)
+class Target(val req: String, val rawreq: ByteArray, val endpoint: String, val baseInput: String)
 
 class Wordlist(val bruteforce: Bruteforce, val observedWords: ConcurrentHashMap.KeySetView<String, Boolean>, val clipboard: ArrayList<String>)
 
-fun evalJython(code: String, baseRequest: String, endpoint: String, baseInput: String, outputHandler: OutputHandler, handler: AttackHandler) {
+fun evalJython(code: String, baseRequest: String, rawRequest: ByteArray, endpoint: String, baseInput: String, outputHandler: OutputHandler, handler: AttackHandler) {
     try {
         Utils.out("Starting attack...")
         val pyInterp = PythonInterpreter() // todo add path to bs4
         handler.code = code
         handler.baseRequest = baseRequest
-        pyInterp.set("target", Target(baseRequest, endpoint, baseInput))
+        handler.rawRequest = rawRequest
+        pyInterp.set("target", Target(baseRequest, rawRequest, endpoint, baseInput))
         pyInterp.set("wordlists", Wordlist(Bruteforce(), Utils.witnessedWords.savedWords, Utils.getClipboard()))
         pyInterp.set("handler", handler)
         pyInterp.set("outputHandler", outputHandler)
@@ -218,6 +219,17 @@ class TurboIntruderFrame(inputRequest: IHttpRequestResponse, val selectionBounds
     private val req = Utils.callbacks.saveBuffersToTempFiles(inputRequest)
 
 
+    private fun getDefaultScript(): String {
+        if (fixedScript != null) {
+            return fixedScript
+        }
+        val defaultScript = Utils.callbacks.loadExtensionSetting("defaultScript")
+        if (defaultScript == null) {
+            return Scripts.SAMPLEBURPSCRIPT
+        } else {
+            return defaultScript
+        }
+    }
 
     override fun actionPerformed(e: ActionEvent?) {
         SwingUtilities.invokeLater {
@@ -249,6 +261,8 @@ class TurboIntruderFrame(inputRequest: IHttpRequestResponse, val selectionBounds
             javax.swing.UIManager.put("RSyntaxTextAreaUI.inputMap", null)
             javax.swing.UIManager.put("RSyntaxTextAreaUI.actionMap", null)
             val textEditor = RSyntaxTextArea(20, 60)
+
+
             textEditor.isEditable = true
             textEditor.setSyntaxEditingStyle(SyntaxConstants.SYNTAX_STYLE_PYTHON)
             textEditor.antiAliasingEnabled = true
@@ -257,7 +271,7 @@ class TurboIntruderFrame(inputRequest: IHttpRequestResponse, val selectionBounds
             textEditor.tabSize = 4
             textEditor.tabsEmulated = true
 
-            if (UIManager.getLookAndFeel().getID().equals("Darcula")) {
+            if (UIManager.getLookAndFeel().getID().contains("Dar")) {
                 val `in` = javaClass.getResourceAsStream("/org/fife/ui/rsyntaxtextarea/themes/dark.xml")
                 try {
                     val theme = Theme.load(`in`)
@@ -279,9 +293,8 @@ class TurboIntruderFrame(inputRequest: IHttpRequestResponse, val selectionBounds
                 val comboItem = codeCombo.getSelectedItem();
                 if(comboItem is DirectoryItem) {
                     try {
-                        if(comboItem.fullPath.endsWith(".py")) {
-                            Files.write( Paths.get(comboItem.fullPath), textEditor.text.toByteArray());
-                        }
+                        Files.write( Paths.get(comboItem.fullPath), textEditor.text.toByteArray());
+
                     } catch (e: IOException) {
                         System.err.println("Failed to write file:$e")
                     }
@@ -296,40 +309,26 @@ class TurboIntruderFrame(inputRequest: IHttpRequestResponse, val selectionBounds
             val messageEditor = Utils.callbacks.createMessageEditor(MessageController(req), true)
             var baseInput = ""
 
+
             if (fixedScript != null) {
-                textEditor.text = fixedScript
                 messageEditor.setMessage(requestOverride?: req.request, true)
             }
             else {
-
                 if (selectionBounds.isNotEmpty() && selectionBounds[0] != selectionBounds[1]) {
                     messageEditor.setMessage(req.request.copyOfRange(0, selectionBounds[0]) + ("%s".toByteArray()) + req.request.copyOfRange(selectionBounds[1], req.request.size), true)
                     baseInput = String(req.request.copyOfRange(selectionBounds[0], selectionBounds[1]), Charsets.ISO_8859_1)
                 } else {
                     messageEditor.setMessage(req.request, true)
                 }
-
-
-                val defaultScript = Utils.callbacks.loadExtensionSetting("defaultScript")
-                if (defaultScript == null) {
-                    textEditor.text = Scripts.SAMPLEBURPSCRIPT
-                } else {
-                    textEditor.text = defaultScript
-                }
             }
-
+            textEditor.text = getDefaultScript()
             textEditor.setEditable(true)
 
             codeCombo.addActionListener {
                 if(codeCombo.itemCount > 0 && !(codeCombo.getSelectedItem() is JSeparator)) {
                     if (codeCombo.selectedIndex == 0) {
                         saveButton.isEnabled = false;
-                        val defaultScript = Utils.callbacks.loadExtensionSetting("defaultScript")
-                        if (defaultScript == null) {
-                            textEditor.text = Scripts.SAMPLEBURPSCRIPT
-                        } else {
-                            textEditor.text = defaultScript
-                        }
+                        textEditor.text = getDefaultScript()
                     } else {
                         val fileName = codeCombo.getSelectedItem().toString()
                         if (fileName.startsWith("examples/")) {
@@ -389,18 +388,27 @@ class TurboIntruderFrame(inputRequest: IHttpRequestResponse, val selectionBounds
                             requestPanel.add(button, BorderLayout.SOUTH)
                             pane.bottomComponent = requestPanel
                             var script = textEditor.text
-                            if(!script.contains("\r\n")) {
-                                script = script.replace("\n", "\r\n")
-                            }
+
+                            // enforce /r/n line endings
+                            script = script.replace("\r\n", "\n")
+                            script = script.replace("\n", "\r\n")
                             Utils.callbacks.saveExtensionSetting("defaultScript", script)
                             Utils.callbacks.helpers
                             val baseRequest = Utils.callbacks.helpers.bytesToString(messageEditor.message)
                             val service = req.httpService
-                            val target = service.protocol + "://" + service.host + ":" + service.port
+
+                            val target: String
+                            if (service.host.contains(":")) {
+                                target = service.protocol + "://[" + service.host + "]:" + service.port
+                            }
+                            else {
+                                target = service.protocol + "://" + service.host + ":" + service.port
+                            }
+
                             this.title += " - running"
                             button.requestFocusInWindow()
                             pane.rootPane.defaultButton = button
-                            evalJython(script, baseRequest, target, baseInput, requestTable, handler)
+                            evalJython(script, baseRequest, messageEditor.message, target, baseInput, requestTable, handler)
                         }
                     }
                 }
@@ -438,7 +446,7 @@ class TurboIntruderFrame(inputRequest: IHttpRequestResponse, val selectionBounds
                     val folderList = folder.listFiles();
                     Arrays.sort(folderList);
                     for (fileEntry in folderList) {
-                        if (fileEntry.name.endsWith(".py")) {
+                        if (!fileEntry.name.startsWith(".")) {
                             codeCombo.addItem(DirectoryItem(folder.absolutePath + "/" + fileEntry.name, fileEntry.name))
                         }
                     }
@@ -449,7 +457,7 @@ class TurboIntruderFrame(inputRequest: IHttpRequestResponse, val selectionBounds
             val exampleFiles = readJar.getFiles("examples")
             exampleFiles.sort()
             for (fileName in exampleFiles) {
-                if (!fileName.endsWith(".py") || fileName.endsWith("__init__.py")) {
+                if (fileName.startsWith(".") || fileName.endsWith("__init__.py")) {
                     continue
                 }
                 codeCombo.addItem(fileName)
@@ -482,7 +490,7 @@ fun main(args : Array<String>) {
             req = req.replace("\n", "\r\n")
         }
         val outputHandler = ConsolePrinter()
-        evalJython(code, req, endpoint, baseInput, outputHandler, attackHandler)
+        evalJython(code, req, File(args[1]).readBytes(), endpoint, baseInput, outputHandler, attackHandler)
     }
 
     catch (e: FileNotFoundException) {
